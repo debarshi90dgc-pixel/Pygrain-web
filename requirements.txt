@@ -1,4 +1,4 @@
-streamlit
+streamlit==1.38.0
 streamlit-drawable-canvas
 opencv-python-headless
 numpy
