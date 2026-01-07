@@ -1,5 +1,7 @@
 streamlit
+streamlit-drawable-canvas
 opencv-python-headless
 numpy
 pandas
 scikit-image
+openpyxl
