@@ -1,7 +1,8 @@
-streamlit
-streamlit-drawable-canvas>=0.9.5
+streamlit==1.38.0
+streamlit-drawable-canvas==0.9.3
 opencv-python-headless
 numpy
 pandas
 scikit-image
 openpyxl
+pillow
