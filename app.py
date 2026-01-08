@@ -2,197 +2,248 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
+from PIL import Image
 from skimage import morphology
 from skimage.segmentation import clear_border
-from streamlit_drawable_canvas import st_canvas
-from PIL import Image
-import io
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-# --- PAGE SETUP ---
+# ----------------------------
+# Helpers
+# ----------------------------
+def odd_clip(x, lo=3, hi=51):
+    x = int(x)
+    x = max(lo, min(hi, x))
+    if x % 2 == 0:
+        x += 1 if x < hi else -1
+    return x
+
+def ensure_session():
+    if "clicks" not in st.session_state:
+        st.session_state.clicks = []
+    if "px_per_mm" not in st.session_state:
+        st.session_state.px_per_mm = None
+
+# ----------------------------
+# Page
+# ----------------------------
 st.set_page_config(page_title="PyGrain Field", page_icon="🪨", layout="wide")
 st.title("🪨 PyGrain Field")
-st.write("A cloud-based tool for pebble size analysis in the field.")
+st.caption("Field-ready pebble sizing (tap-to-calibrate scale + automatic minimum area).")
 
-# --- SIDEBAR & INSTRUCTIONS ---
-st.sidebar.header("1. Image & Calibration")
-uploaded_file = st.sidebar.file_uploader("Upload Field Photo", type=['jpg', 'jpeg', 'png'])
+ensure_session()
 
-# Initialize session state for scale if not present
-if 'px_per_mm' not in st.session_state:
-    st.session_state['px_per_mm'] = None
+# ----------------------------
+# Sidebar: Upload + Settings
+# ----------------------------
+st.sidebar.header("1) Upload")
+uploaded_file = st.sidebar.file_uploader("Upload field photo", type=["jpg", "jpeg", "png"])
 
+st.sidebar.header("2) Detection settings")
+invert = st.sidebar.checkbox(
+    "Invert threshold (use if pebbles are darker than background)",
+    value=True,
+    help="If detection looks wrong (background detected as pebble), toggle this."
+)
+
+min_diam_mm = st.sidebar.number_input(
+    "Minimum pebble diameter (mm)",
+    value=4.0, min_value=0.1, step=0.5,
+    help="Pebbles smaller than this will be ignored. This replaces 'Minimum Pebble Area' and is field-friendly."
+)
+
+auto_kernel = st.sidebar.checkbox(
+    "Auto kernel size (recommended)",
+    value=True,
+    help="Auto chooses kernel based on your scale + minimum diameter. Turn off only if you want manual tuning."
+)
+
+manual_kernel = st.sidebar.slider(
+    "Morph kernel size (odd)",
+    min_value=3, max_value=51, value=25, step=2,
+    help=("Controls separation of touching pebbles. "
+          "Higher = stronger separation but may slightly shrink edges. "
+          "Lower = less separation, may merge pebbles.")
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("3) Controls")
+if st.sidebar.button("Clear calibration clicks"):
+    st.session_state.clicks = []
+    st.session_state.px_per_mm = None
+
+# ----------------------------
+# If no upload
+# ----------------------------
 if uploaded_file is None:
-    st.info("👈 Please upload an image to begin. Ensure a scale reference (e.g., ruler) is visible.")
+    st.info("👈 Upload an image to begin. Include a reference object (ruler/coin/card) in the same plane as pebbles.")
     st.stop()
 
-# --- MAIN LOGIC START ---
-# Decode image immediately so we know its dimensions for the canvas
-file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-img_bgr = cv2.imdecode(file_bytes, 1)
+# ----------------------------
+# Read image
+# ----------------------------
+img_bytes = uploaded_file.read()
+img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+img_bgr = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+if img_bgr is None:
+    st.error("Could not read image. Please upload a valid JPG/PNG.")
+    st.stop()
+
 img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 pil_img = Image.fromarray(img_rgb)
-img_height, img_width = img_bgr.shape[:2]
+H, W = img_bgr.shape[:2]
 
-# =========================================
-# STEP 1: VISUAL CALIBRATION (The biggest change)
-# =========================================
-st.write("### Step 2: Set the Scale")
-st.write("Draw a line along your reference object (e.g., ruler) in the image below.")
+# ----------------------------
+# Step 1: Calibration by tapping 2 points
+# ----------------------------
+st.subheader("Step 1 — Set the scale (tap two points on the reference)")
+st.write("Tap **start point** and **end point** of a known-length reference (e.g., 0 to 100 mm on a ruler).")
 
-# Calculate canvas dimensions to fit screen while maintaining aspect ratio
-# We limit max width to 700px for usability on phones
-canvas_width = min(700, img_width)
-canvas_height = int(canvas_width * (img_height / img_width))
+display_width = min(900, W)  # phone-friendly
+scale_factor = W / display_width
 
-# The drawing canvas widget
-canvas_result = st_canvas(
-    fill_color="rgba(255, 165, 0, 0.3)",
-    stroke_width=3,
-    stroke_color="#FF0000",
-    background_image=pil_img,
-    update_streamlit=True,
-    height=canvas_height,
-    width=canvas_width,
-    drawing_mode="line",
-    key="canvas",
-)
+coords = streamlit_image_coordinates(pil_img, width=display_width, key="img_coords")
 
-# Calculate pixel distance from drawn line
-ref_len_px = 0.0
-if canvas_result.json_data is not None:
-    objects = pd.json_normalize(canvas_result.json_data["objects"])
-    if len(objects) > 0:
-        # Get coordinates of the last drawn line
-        obj = objects.iloc[-1]
-        x1, y1, x2, y2 = obj['left'], obj['top'], obj['left'] + obj['width'] * obj['scaleX'], obj['top'] + obj['height'] * obj['scaleY']
-        # Euclidean distance formulation
-        drawn_distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-        # Scale back up to original image dimensions
-        scale_factor = img_width / canvas_width
-        ref_len_px = drawn_distance * scale_factor
+if coords is not None and "x" in coords and "y" in coords:
+    # Save click
+    st.session_state.clicks.append((coords["x"], coords["y"]))
+    # keep only last 2 clicks
+    st.session_state.clicks = st.session_state.clicks[-2:]
 
-# Inputs for physical length
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("Measured Pixels (px)", f"{ref_len_px:.1f}")
-with col2:
-    ref_len_mm = st.number_input("Enter Known Length (mm)", value=50.0, min_value=0.1, 
-                                 help="Enter the physical length in millimeters of the line you just drew.")
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    st.write("**Clicks:**", len(st.session_state.clicks))
+with c2:
+    if len(st.session_state.clicks) == 2:
+        (x1d, y1d), (x2d, y2d) = st.session_state.clicks
+        dx = (x2d - x1d) * scale_factor
+        dy = (y2d - y1d) * scale_factor
+        ref_len_px = float(np.sqrt(dx*dx + dy*dy))
+        st.metric("Reference length (px)", f"{ref_len_px:.1f}")
+    else:
+        ref_len_px = 0.0
+        st.metric("Reference length (px)", "—")
+with c3:
+    ref_len_mm = st.number_input(
+        "Enter known length (mm)",
+        value=100.0, min_value=0.1,
+        help="Example: if you tapped 0 to 10 cm on a ruler, enter 100 mm."
+    )
 
 if ref_len_px > 0:
-    st.session_state['px_per_mm'] = ref_len_px / ref_len_mm
-    st.success(f"Calibration set: 1 mm = {st.session_state['px_per_mm']:.2f} pixels")
+    st.session_state.px_per_mm = ref_len_px / ref_len_mm
+    st.success(f"✅ Scale set: **1 mm = {st.session_state.px_per_mm:.3f} px**")
 else:
-    st.warning("Please draw a line on the scale object above to calibrate.")
+    st.warning("Tap **two points** on the image to set the scale.")
 
-# =========================================
-# STEP 2: USER-FRIENDLY TUNING
-# =========================================
-st.write("---")
-st.write("### Step 3: Analysis Settings")
-st.sidebar.header("2. Tuning Parameters")
+# ----------------------------
+# Step 2: Automatic Minimum Area + Kernel suggestion
+# ----------------------------
+st.subheader("Step 2 — Automatic filters & guidance")
 
-# 1. User-friendly "Min Diameter mm" instead of abstract "Min Area px"
-min_diam_mm = st.sidebar.number_input(
-    "Minimum Pebble Diameter (mm)", 
-    value=4.0, min_value=0.1, step=0.5,
-    help="The smallest grain size you want to detect. Pebbles smaller than this will be ignored."
-)
+if st.session_state.px_per_mm is None:
+    st.info("Set the scale first (two taps) — then the app will auto-compute minimum area and kernel suggestion.")
+    st.stop()
 
-# Calculate min area in pixels based on scale
-if st.session_state['px_per_mm']:
-    # Area of circle = pi * r^2 = pi * (diam/2)^2
-    min_area_mm2 = np.pi * (min_diam_mm / 2)**2
-    # Convert mm^2 to px^2: area_px = area_mm2 * (px_per_mm)^2
-    min_area_px = min_area_mm2 * (st.session_state['px_per_mm']**2)
-    st.sidebar.caption(f"(Calculated Min Area: {int(min_area_px)} px²)")
-else:
-    min_area_px = 700 # Fallback default if scale isn't set yet
+px_per_mm = st.session_state.px_per_mm
 
-# 2. Morph Kernel with helpful tooltip
-morph_size = st.sidebar.slider(
-    "Segmentation Strength (Morph Kernel)", 3, 51, 25, step=2,
-    help="Controls how aggressively the app separates touching pebbles. Higher values separate better but may slightly shrink the detected size. Try increasing this if pebbles are merged together."
-)
+# Minimum area derived from min diameter (circle approximation)
+min_area_mm2 = np.pi * (min_diam_mm / 2.0) ** 2
+min_area_px = min_area_mm2 * (px_per_mm ** 2)
 
-# =========================================
-# STEP 3: RUN ANALYSIS (Essentially original logic)
-# =========================================
-st.write("---")
-btn_col1, _ = st.columns([1, 2])
-with btn_col1:
-    run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
+# Kernel suggestion based on min diameter in pixels (simple practical heuristic)
+min_diam_px = min_diam_mm * px_per_mm
+kernel_suggest = odd_clip(0.6 * min_diam_px, lo=3, hi=51)
 
-if run_btn:
-    if st.session_state['px_per_mm'] is None or ref_len_px == 0:
-        st.error("Please calibrate the scale by drawing a line before running analysis.")
-        st.stop()
+kcol1, kcol2, kcol3 = st.columns(3)
+kcol1.metric("Min diameter (px)", f"{min_diam_px:.1f}")
+kcol2.metric("Min area (px²)", f"{int(min_area_px)}")
+kcol3.metric("Suggested kernel", f"{kernel_suggest}")
 
-    with st.spinner('Processing image...'):
+kernel_size = kernel_suggest if auto_kernel else manual_kernel
+
+with st.expander("How to choose Morph Kernel (field guidance)"):
+    st.markdown(
+        f"""
+- **Kernel controls separation of touching pebbles** (morphological closing/cleanup strength).
+- If **two pebbles merge into one**, increase kernel a bit.
+- If **pebbles look over-smoothed / edges shrink**, decrease kernel.
+- Current suggestion is based on your minimum diameter: **{kernel_suggest}** (odd).
+"""
+    )
+
+# ----------------------------
+# Step 3: Run analysis
+# ----------------------------
+st.subheader("Step 3 — Run analysis")
+
+run = st.button("Run Analysis", type="primary", use_container_width=True)
+
+if run:
+    with st.spinner("Processing..."):
         try:
-            pixels_per_mm = st.session_state['px_per_mm']
-            
-            # Preprocess
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             blur = cv2.GaussianBlur(gray, (7, 7), 2)
-            _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-            # Morph Closing
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_size, morph_size))
+            # Otsu threshold
+            thresh_type = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+            _, binary = cv2.threshold(blur, 0, 255, thresh_type + cv2.THRESH_OTSU)
+
+            # Morph close
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-            # Cleaning using calculated min_area_px
-            bin_clean = morphology.remove_small_objects(closed > 0, min_size=min_area_px)
-            bin_clean = morphology.remove_small_holes(bin_clean, area_threshold=min_area_px)
-            bin_clean = clear_border(bin_clean)
-            binary_clean = (bin_clean * 255).astype(np.uint8)
+            # skimage cleaning
+            bw = closed > 0
+            bw = morphology.remove_small_objects(bw, min_size=int(min_area_px))
+            bw = morphology.remove_small_holes(bw, area_threshold=int(min_area_px))
+            bw = clear_border(bw)
+            binary_clean = (bw.astype(np.uint8) * 255)
 
-            # Contours
             contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            results = []
-            img_disp = img_bgr.copy()
-            pebble_id = 0
-            
-            for cnt in contours:
-                if cv2.contourArea(cnt) < min_area_px: continue
-                
-                pebble_id += 1
-                
-                # Fit Ellipse
-                if len(cnt) >= 5:
-                    ellipse = cv2.fitEllipse(cnt)
-                    (xc, yc), (major, minor), angle = ellipse
-                    
-                    # Draw
-                    cv2.ellipse(img_disp, ellipse, (0, 255, 255), 2)
-                    cv2.putText(img_disp, str(pebble_id), (int(xc), int(yc)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-                    
-                    # Metrics
-                    a_mm = (major / 2) / pixels_per_mm
-                    b_mm = (minor / 2) / pixels_per_mm
-                    Deq_mm = np.sqrt(a_mm * b_mm)
-                    results.append(Deq_mm)
 
-            # --- SHOW RESULTS ---
-            st.image(img_disp, caption=f"Detected {pebble_id} Pebbles", channels="BGR")
-            
-            if results:
-                d50 = np.median(results)
-                st.success(f"✅ **D50 Size:** {d50:.2f} mm")
-                
-                # Data Table
-                df = pd.DataFrame(results, columns=["Deq (mm)"])
-                df.index += 1
-                with st.expander("View Raw Data Table"):
-                    st.dataframe(df)
-                    
-                # Download
-                csv = df.to_csv().encode('utf-8')
-                st.download_button("Download Results (CSV)", csv, "field_results.csv", "text/csv")
+            out = img_bgr.copy()
+            deq_list = []
+            pid = 0
+
+            for cnt in contours:
+                if cv2.contourArea(cnt) < min_area_px:
+                    continue
+
+                if len(cnt) < 5:
+                    continue  # ellipse needs >=5 points
+
+                ellipse = cv2.fitEllipse(cnt)
+                (xc, yc), (major, minor), angle = ellipse
+
+                pid += 1
+                cv2.ellipse(out, ellipse, (0, 255, 255), 2)
+                cv2.putText(out, str(pid), (int(xc), int(yc)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+                a_mm = (major / 2.0) / px_per_mm
+                b_mm = (minor / 2.0) / px_per_mm
+                deq_mm = float(np.sqrt(a_mm * b_mm))
+                deq_list.append(deq_mm)
+
+            st.image(out, channels="BGR", caption=f"Detected pebbles: {pid}")
+
+            if len(deq_list) == 0:
+                st.warning("No pebbles detected. Try lowering minimum diameter or toggling invert threshold.")
             else:
-                st.warning("No pebbles detected. Try decreasing the 'Minimum Pebble Diameter'.")
-                
+                df = pd.DataFrame({"Pebble_ID": np.arange(1, len(deq_list) + 1),
+                                   "Deq_mm": np.round(deq_list, 3)})
+                d50 = float(np.median(deq_list))
+                st.success(f"✅ **D50 = {d50:.2f} mm**")
+
+                with st.expander("Raw results table"):
+                    st.dataframe(df, use_container_width=True)
+
+                st.download_button(
+                    "Download CSV",
+                    data=df.to_csv(index=False).encode("utf-8"),
+                    file_name="pygrain_field_results.csv",
+                    mime="text/csv"
+                )
+
         except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+            st.error(f"Processing failed: {e}")
