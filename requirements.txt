@@ -1,8 +1,9 @@
-streamlit==1.32.0
-streamlit-drawable-canvas==0.9.3
+streamlit
+streamlit-image-coordinates
 opencv-python-headless
-numpy<2.0.0
-pandas
-scikit-image
+numpy>=1.26,<2.0
+pandas>=2.1,<2.3
+scikit-image>=0.23,<0.25
 pillow
 openpyxl
+
